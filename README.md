@@ -1,193 +1,134 @@
 # Asynchronous HTTP Server in C
 
-An asynchronous HTTP server implemented in **C** using Linux low-level I/O and networking APIs.
+An asynchronous HTTP server implemented in **C** using low-level Linux networking and I/O mechanisms.
 
-The project explores event-driven server architecture, non-blocking TCP sockets, I/O multiplexing with `epoll`, asynchronous file operations using Linux AIO, and efficient static file transfer using `sendfile`.
+The project focuses on the internal architecture of an event-driven web server and on how multiple types of I/O can be coordinated without relying on a high-level networking framework. It uses TCP sockets for communication, non-blocking client connections, `epoll` for event monitoring, `sendfile` for efficient static file transfers, and Linux asynchronous I/O together with `eventfd` for dynamic resources.
 
----
-
-## Overview
-
-The server listens for incoming HTTP connections and serves files requested by clients.
-
-Instead of assigning a dedicated thread or blocking process to every connection, the server uses an **event-driven architecture** based on Linux `epoll`.
-
-Client sockets are configured as non-blocking, allowing multiple connections and I/O events to be managed through a single event loop.
-
-HTTP requests are parsed to determine the requested resource, after which the server chooses an appropriate file-transfer strategy.
-
----
-
-## Key Features
-
-- TCP server implemented using Linux sockets
-- Non-blocking client connections
-- Event-driven architecture using `epoll`
-- HTTP request parsing
-- Per-connection state machine
-- HTTP `200 OK` responses
-- HTTP `404 Not Found` handling
-- Static file transfer using `sendfile`
-- Asynchronous file reads using Linux AIO
-- Completion notifications using `eventfd`
-- Explicit connection and resource management
-- Incremental buffered socket writes
-
----
+Instead of hiding the networking details behind an existing server library, the implementation works directly with sockets, file descriptors, HTTP parsing, connection states, file operations, and kernel interfaces. This makes the project mainly an exercise in systems programming and in understanding how asynchronous servers are built at a lower level.
 
 ## Server Architecture
 
-The server initializes a TCP listening socket and binds it to port `8888`.
+The application starts by creating a TCP socket, enabling address reuse, binding it to port `8888`, and placing it in listening mode.
 
-Incoming connections are accepted and configured in non-blocking mode.
+The listening socket is registered with an `epoll` instance, which becomes the central mechanism used by the server to wait for activity. When a new client connects, the connection is accepted and its socket is configured as non-blocking using `fcntl` and the `O_NONBLOCK` flag.
 
-Each connection is represented by a dedicated structure containing:
+Each client is represented by a dedicated connection structure containing the socket descriptor, requested file information, HTTP parser state, receive and send buffers, file position, asynchronous I/O structures, an `eventfd`, and the current state of the connection.
 
-- Client socket descriptor
-- File descriptor
-- HTTP parser state
-- Receive and send buffers
-- Requested path
-- File size and current position
-- Linux AIO control structures
-- `eventfd` descriptor
-- Current connection state
+This allows all information related to a request to remain associated with its connection while the server moves between different stages of processing.
 
-The listening socket and connection-related events are monitored through an `epoll` instance.
-
-The main event loop waits for events and dispatches them to the appropriate connection logic.
-
----
-
-## Event-Driven I/O with epoll
-
-The project uses Linux `epoll` to efficiently monitor file descriptors for I/O events.
-
-Instead of continuously polling every connection or blocking while waiting for data, the server waits for the kernel to report descriptors that are ready for processing.
-
-New client sockets are configured using:
-
-```text
-O_NONBLOCK
-```
-
-and registered with the `epoll` instance.
-
-This architecture allows the server to manage multiple I/O operations through a centralized event loop.
-
----
-
-## Connection State Machine
-
-Each client connection progresses through a state machine describing its current stage.
-
-States include:
-
-```text
-STATE_INITIAL
-STATE_RECEIVING_DATA
-STATE_REQUEST_RECEIVED
-STATE_SENDING_HEADER
-STATE_HEADER_SENT
-STATE_ASYNC_ONGOING
-STATE_SENDING_DATA
-STATE_DATA_SENT
-STATE_SENDING_404
-STATE_404_SENT
-STATE_CONNECTION_CLOSED
-```
-
-Separating connection behavior into explicit states makes it possible to coordinate request parsing, file operations, asynchronous I/O completion, and response transmission without relying on blocking control flow.
-
----
+The main server loop waits for events using `epoll_wait()` and reacts when either a new connection arrives or an existing connection has work that can be processed.
 
 ## HTTP Request Processing
 
-Incoming data is received from the client socket and passed to an HTTP parser.
+Data received from a client is stored in a connection-specific receive buffer and passed to an HTTP parser.
 
-A path callback extracts the requested resource from the HTTP request and stores it in the connection structure.
+The project uses an HTTP parser callback to extract the requested path from the incoming request. Once a valid path has been found, the request can move to the next stage and the server attempts to locate the corresponding file.
 
-The server distinguishes between two resource categories:
+Requested resources are divided into two categories based on their path: `/static/` and `/dynamic/`.
 
-```text
-/static/
-/dynamic/
-```
+The server constructs the corresponding file name and attempts to open the requested resource. The implementation serves `.dat` files, converting the requested file extension to `.dat` when necessary.
 
-If the requested file cannot be opened, the server prepares and sends an HTTP:
+If the file is found, its size is obtained using `fstat()` and the server prepares an HTTP `200 OK` response containing the appropriate `Content-Length`.
 
-```text
-404 Not Found
-```
+If the requested file cannot be opened or the resource is invalid, the connection is prepared for an HTTP `404 Not Found` response instead.
 
-response.
+The connection is closed after the response has been completed.
 
-For valid files, an HTTP `200 OK` response header is generated with the appropriate content length.
+## Event-Driven Connection Management
 
----
+A central part of the project is the use of an explicit connection state machine.
 
-## Static File Transfer
+Rather than processing an entire request through one long blocking sequence, every connection stores its current state and progresses through the server depending on what operation has completed.
 
-Static resources are transferred using the Linux `sendfile` system call.
+The available states represent stages such as receiving request data, processing a received request, sending the HTTP header, performing an asynchronous operation, sending file data, handling a `404` response, and finally closing the connection.
 
-`sendfile` provides an efficient mechanism for transferring file contents directly to a socket without requiring the application to manually copy every chunk through a user-space buffer.
+Examples include `STATE_INITIAL`, `STATE_REQUEST_RECEIVED`, `STATE_SENDING_HEADER`, `STATE_ASYNC_ONGOING`, `STATE_SENDING_DATA`, and `STATE_CONNECTION_CLOSED`.
 
-This path is used for requests targeting the `/static/` resource directory.
+Using explicit states makes it easier to separate the different parts of the request lifecycle and coordinate socket communication with file I/O.
 
----
+This approach is particularly useful in an event-driven server because an operation may not be completed immediately. The server has to remember where a connection stopped and continue processing it when the corresponding event becomes available.
 
-## Asynchronous File I/O
+## Static and Dynamic File Transfers
 
-Dynamic resources are handled using Linux asynchronous I/O through `libaio`.
+The server uses different strategies depending on the type of resource requested by the client.
 
-The server initializes an asynchronous I/O context using:
+Static resources are transferred using the Linux `sendfile()` system call.
 
-```text
-io_setup
-```
+Instead of repeatedly reading data from a file into a user-space buffer and then sending that buffer through the socket, `sendfile()` allows file contents to be transferred more directly between file descriptors.
 
-and submits file read operations using:
+This provides a simple and efficient path for resources requested from the `/static/` directory.
 
-```text
-io_submit
-```
+Dynamic resources use a different mechanism based on Linux asynchronous I/O.
 
-Completed operations are retrieved through:
+For these requests, the server prepares an asynchronous file read and submits it using `io_submit()`. The operation reads file data into the connection's send buffer without following the same blocking file-read approach that would normally be used with `read()`.
 
-```text
-io_getevents
-```
+Once a portion of the file has been loaded, the contents of the buffer are sent through the client socket. If additional data remains, another asynchronous read can be started until the entire file has been processed.
 
-This allows file reads to be coordinated without using a traditional blocking `read` operation for every chunk.
+Having separate static and dynamic paths makes the project a useful comparison between `sendfile()` and explicit asynchronous file I/O.
 
----
+## Linux AIO and eventfd
 
-## eventfd Integration
+Dynamic file operations are implemented using the Linux native asynchronous I/O interface provided through `libaio`.
 
-Asynchronous file operations are associated with an `eventfd`.
+At server startup, an AIO context is initialized using `io_setup()`. Each connection contains the control structures necessary for submitting an asynchronous read operation.
 
-The event descriptor provides a mechanism for notifying the event-driven system when an asynchronous operation completes.
+Before starting a read, the server prepares an I/O control block containing the file descriptor, destination buffer, amount of data to read, and current offset inside the file.
 
-This allows asynchronous file I/O completion to participate in the same general event-processing architecture used by the server.
+The request is then submitted using `io_submit()`.
 
----
+An `eventfd` is associated with the asynchronous operation using `io_set_eventfd()`. This gives the server a file descriptor that can be used as a notification mechanism when the operation completes and allows asynchronous file activity to be integrated with the event-driven architecture.
 
-## Buffered Socket Transmission
+After completion, `io_getevents()` is used to obtain the result of the asynchronous operation. The connection updates its current file position and sends the newly available data to the client.
 
-Data read asynchronously from files is stored in a connection-specific send buffer.
+If the file has not been completely processed, another asynchronous operation is submitted. Otherwise, the connection can be closed.
 
-The server then attempts to transmit as much data as possible through the non-blocking socket.
+This part of the implementation combines several Linux-specific mechanisms and was one of the main systems-programming aspects of the project.
 
-The implementation explicitly handles:
+## Non-Blocking Socket I/O
 
-```text
-EAGAIN
-EWOULDBLOCK
-```
+Accepted client sockets are explicitly configured in non-blocking mode.
 
-which indicate that the socket currently cannot accept additional data without blocking.
+When the server sends data using `send()`, it cannot assume that the entire buffer will always be accepted by the socket immediately. The implementation therefore keeps track of how much data has been transmitted and continues while progress can be made.
 
----
+The cases represented by `EAGAIN` and `EWOULDBLOCK` are handled separately because they do not necessarily represent a permanent connection failure. They indicate that sending additional data would currently block.
+
+Working with non-blocking sockets changes the way network applications have to be structured. Instead of assuming that every operation completes immediately, the server has to coordinate socket readiness, connection state, buffering, and file operations.
+
+Together with `epoll`, this forms the basis of the event-driven model used throughout the project.
+
+## Resource and Connection Management
+
+The server manages network connections and file resources explicitly.
+
+When a connection is finished, its socket is removed from the `epoll` instance and the associated file descriptors are closed.
+
+The project also keeps track of file positions, response buffers, parser state, asynchronous I/O structures, and connection states inside each connection handler.
+
+TCP communication is built directly on top of the Linux socket API, using operations such as `socket()`, `setsockopt()`, `bind()`, `listen()`, `accept()`, `recv()`, `send()`, and `shutdown()`.
+
+This direct interaction with the operating system was an important part of the project, since it required managing the complete lifecycle of a connection instead of relying on an external web-server framework.
+
+## Project Structure
+
+- `aws.c` — main server implementation, event loop, connection handling, HTTP processing, static transfers, and asynchronous file I/O
+- `aws.h` — connection structure, server constants, connection states, resource types, and function declarations
+- `http-parser/` — HTTP parsing implementation used to extract information from incoming requests
+- `utils/sock_util.c` / `utils/sock_util.h` — helper functions for TCP socket creation, connection management, and peer information
+- `utils/w_epoll.h` — helper functions for working with `epoll`
+- `utils/debug.h` / `utils/util.h` — debugging and utility definitions
+- `Makefile` — project build configuration
+
+## Build and Run
+
+The project is designed for a **Linux environment** and is built using **GCC** and **GNU Make**.
+
+Running `make` compiles the server, the HTTP parser, and the socket utilities and produces the `aws` executable.
+
+The project links against `libaio`, so the Linux AIO library must be available on the system when the server is built.
+
+The server listens on port `8888` and uses the current directory as its document root.
+
+Resources under `/static/` are handled through the static transfer path using `sendfile()`, while resources under `/dynamic/` are handled through Linux asynchronous I/O.
 
 ## Technologies and Concepts
 
@@ -195,43 +136,19 @@ which indicate that the socket currently cannot accept additional data without b
 - Linux
 - TCP/IP
 - HTTP
-- BSD Sockets API
-- Non-blocking I/O
-- epoll
-- Linux AIO / libaio
-- eventfd
-- sendfile
-- File descriptors
-- HTTP parsing
-- State machines
+- BSD sockets
+- Non-blocking sockets
 - Event-driven programming
+- `epoll`
+- Linux AIO / `libaio`
+- `eventfd`
+- `sendfile`
+- HTTP parsing
+- File descriptors
+- State machines
+- Asynchronous file I/O
+- Low-level network programming
 - System calls
+- Resource management
+- GCC
 - GNU Make
-
----
-
-## Build
-
-The project uses GCC and GNU Make.
-
-The server is linked against `libaio`.
-
-```bash
-make
-```
-
-The resulting executable is:
-
-```text
-aws
-```
-
----
-
-## Technical Focus
-
-The primary focus of the project is understanding how asynchronous and event-driven servers can be implemented using low-level Linux primitives.
-
-Rather than relying on a high-level networking framework, the implementation directly manages sockets, file descriptors, connection states, HTTP parsing, asynchronous disk operations, and resource cleanup.
-
-The project demonstrates how mechanisms such as `epoll`, non-blocking sockets, `eventfd`, Linux AIO, and `sendfile` can be combined to construct an asynchronous HTTP server.
